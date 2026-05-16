@@ -4,13 +4,22 @@
 // Algorithm follows Jatin Chowdhury's "Complex Nonlinearities — Wavefolder":
 // https://ccrma.stanford.edu/~jatin/ComplexNonlinearities/Wavefolder.html
 //
-// The DSP lives in Wavefolder.cs. This file handles:
+// v1.1 adds four parameters on top of the v1.0 five:
+//   Bias    — pre-fold DC offset for asymmetric folding
+//   PreTilt — tilt EQ at 800 Hz that shapes what hits the folder
+//   Shape   — fold curve selector (Sine / Triangle / Wrap)
+//   OS      — oversampling factor (1× / 2× / 4×)
+//
+// The DSP lives in Wavefolder.cs (fold math), PreTilt.cs (tilt EQ), and
+// Oversampler.cs (FIR half-band 2×/4×). This file handles:
 //   • ReBuzz IBuzzMachine plumbing (Build §6.2 — both SDK usings)
 //   • Parameter declarations (PedalComp §2 — non-negative MinValue)
 //   • The bool Work(output, input, n, mode) effect signature
 //     (PedalComp §1 — ±32768 ↔ ±1.0 normalisation at the edges)
 //   • Per-Work parameter smoothing (Core §32 — two-stage exponential +
 //     per-sample lerp for zipper-free modulation by external LFOs)
+//   • The OS dispatch — picks one of three pre-allocated Oversampler
+//     instances per channel based on the OS parameter
 
 using System;
 using Buzz.MachineInterface;
@@ -34,11 +43,16 @@ namespace PedalFolder
         const float INV_SCALE = 32768f;
 
         // Core §32: smoothing time constant. 10 ms is the general default
-        // documented for modulation-friendly continuous parameters. Drive
-        // and Fold change the harmonic content audibly, so any value much
-        // shorter than this risks zipper at fast modulation rates; values
-        // much longer feel sluggish under finger control.
+        // documented for modulation-friendly continuous parameters. Drive,
+        // Fold, Bias and PreTilt-gains all use this constant so per-Work
+        // ramp times stay consistent across the smoothed parameters.
         const float SMOOTH_SECS = 0.010f;
+
+        // PreTilt pivot frequency. 800 Hz sits in the lower-mid range — low
+        // enough to clearly affect bass when boosted, high enough to keep
+        // the "treble" band including most of the harmonic excitement the
+        // wavefolder generates. Hard-coded; not user-exposed.
+        const float PRE_TILT_CORNER_HZ = 800f;
 
         // ── Host ─────────────────────────────────────────────────────────────
         readonly IBuzzMachineHost host;
@@ -50,12 +64,14 @@ namespace PedalFolder
 
         // ── Parameters ───────────────────────────────────────────────────────
         //
-        // All ranges 0..127 (Byte parameter, NoValue = 255, well clear of
-        // the Core §9 ceiling). All MinValues ≥ 0 per PedalComp §2.
+        // Continuous parameters: 0..127 range (Byte parameter, NoValue = 255,
+        // well clear of the Core §9 ceiling). All MinValues ≥ 0 per
+        // PedalComp §2.
         //
-        // Order is the canonical declaration order — DO NOT REORDER, as
-        // preset bundles (if added later) key off declaration index per
-        // Build §3.3.
+        // Declaration order is canonical. Per Build §3.3, never reorder
+        // existing parameters. v1.1 appends Bias, PreTilt, Shape, and OS
+        // AFTER the v1.0 five — old presets that don't know about these
+        // params get the declared DefValue, which preserves v1.0 character.
 
         [ParameterDecl(
             Name        = "Drive",
@@ -67,7 +83,7 @@ namespace PedalFolder
 
         [ParameterDecl(
             Name        = "Fold",
-            Description = "Wavefolder injection amount (G) — how much sin-fold is mixed in",
+            Description = "Wavefolder injection amount (G) — how much fold is mixed in",
             MinValue    = 0,
             MaxValue    = 127,
             DefValue    = 64)]
@@ -97,72 +113,120 @@ namespace PedalFolder
             DefValue    = 127)]
         public int Mix { get; set; } = 127;
 
+        // ── v1.1 additions ───────────────────────────────────────────────────
+
+        [ParameterDecl(
+            Name        = "Bias",
+            Description = "Pre-fold DC offset — 64 = no bias, sweeps to ±2.0",
+            MinValue    = 0,
+            MaxValue    = 127,
+            DefValue    = 64)]
+        public int Bias { get; set; } = 64;
+
+        [ParameterDecl(
+            Name        = "PreTilt",
+            Description = "Tilt EQ before the folder — 64 = flat, ±12 dB at the pivot",
+            MinValue    = 0,
+            MaxValue    = 127,
+            DefValue    = 64)]
+        public int PreTilt { get; set; } = 64;
+
+        [ParameterDecl(
+            Name              = "Shape",
+            Description       = "Fold curve — Sine (smooth) / Triangle (sharp) / Wrap (harsh)",
+            MinValue          = 0,
+            MaxValue          = 2,
+            DefValue          = 0,
+            ValueDescriptions = new[] { "Sine", "Triangle", "Wrap" })]
+        public int Shape { get; set; } = 0;
+
+        [ParameterDecl(
+            Name              = "OS",
+            Description       = "Oversampling factor — higher = cleaner but more CPU",
+            MinValue          = 0,
+            MaxValue          = 2,
+            DefValue          = 1,                    // = 2× (good fresh-load sound)
+            ValueDescriptions = new[] { "1×", "2×", "4×" })]
+        public int OS { get; set; } = 1;
+
         // ── Parameter mapping helpers ────────────────────────────────────────
         //
         // Each raw 0..127 parameter is mapped to a DSP coefficient. The maps
         // are tuned so the default values (declared above) produce a sensible
-        // mild-fold sound out of the box:
-        //   • Drive=32  → ~2.0× pre-fold gain (+6 dB)
-        //   • Fold=64   → ~0.5  (the page's "G ≈ −0.5" recommendation)
-        //   • Feedback=0 → 0    (saturating wavefolder; no feedback path)
-        //   • Output=64 → 1.0  (unity)
-        //   • Mix=127   → 1.0  (fully wet)
+        // mild-fold sound out of the box.
 
-        // Drive: 0..127 → 1.0 .. ~20.0 (linear gain). Exponential so the
-        // knob feels even across its range (small movements at the low end
-        // are small drive changes; small movements at the high end are
-        // small drive changes too, on a perceptual log scale).
-        static float MapDrive(int v)
-        {
-            // v=0  → 1.0 (no drive), v=64 → ~4.5, v=127 → ~20.0
-            return MathF.Exp(v * (3.0f / 127f));
-        }
+        // Drive: 0..127 → 1.0 .. ~20.0 (linear gain), exponential curve.
+        // v=0 → 1.0, v=64 → ~4.5, v=127 → ~20.0
+        static float MapDrive(int v) => MathF.Exp(v * (3.0f / 127f));
 
         // Fold: 0..127 → 0.0 .. 1.0 (linear).
-        // 0.0 = no wavefold contribution (pure tanh sat),
-        // 0.5 = the canonical Jatin recommendation,
-        // 1.0 = max fold (heavy harmonics).
         static float MapFold(int v) => v / 127f;
 
-        // Feedback: 0..127 → 0.0 .. 0.95. We cap below 1.0 to keep the
-        // closed loop stable; values near 1.0 are where the resonance is
-        // most pronounced. The page uses 0.9 as its demo value.
+        // Feedback: 0..127 → 0.0 .. 0.95 (capped below 1.0 for stability).
         static float MapFeedback(int v) => v * (0.95f / 127f);
 
-        // Output: 0..127, with 64 = unity. Maps to ~−24 dB .. +12 dB.
-        // Below 64 attenuates (good for taming the post-fold level boost
-        // that heavy fold produces); above 64 makes up if needed.
+        // Output: piecewise dB centred at 64.
+        //   v=0  → −24 dB → 0.0631
+        //   v=64 → 0   dB → 1.0
+        //   v=127→ +12 dB → 3.98
         static float MapOutput(int v)
         {
-            // Convert to dB centred on 64, then to linear gain.
-            //   v=0  → −24 dB → 0.0631
-            //   v=64 → 0    dB → 1.0
-            //   v=127→ +12  dB → 3.98
-            // Slope: 24 dB below 64 (0.375 dB per step), 12 dB above 64
-            // (0.190 dB per step). We use a piecewise map to make the
-            // "attenuate" side wider than the "boost" side — boosting a
-            // wavefolder usually causes more harm than good.
-            float db = (v < 64) ? (v - 64) * (24f / 64f)     // 0..63 → −24..−0.375
-                                : (v - 64) * (12f / 63f);   // 64..127 → 0..+12
+            float db = (v < 64) ? (v - 64) * (24f / 64f)
+                                : (v - 64) * (12f / 63f);
             return MathF.Pow(10f, db / 20f);
         }
 
-        // Mix: 0..127 → 0.0 .. 1.0 (linear). 0 = dry, 1 = wet.
-        // Linear is fine here — we're crossfading time-correlated signals
-        // (the wet is derived from the dry), so an equal-power curve would
-        // over-boost the centre. Linear keeps the level honest as you sweep.
+        // Mix: 0..127 → 0.0 .. 1.0 (linear — preserves dry level at centre).
         static float MapMix(int v) => v / 127f;
+
+        // Bias: 0..127 → ~−2.0 .. +2.0, centred at 64.
+        // Range chosen wide enough to push x_drv past a full fold of the
+        // shape function — bias near ±2 sits at the next fold lobe even
+        // with Drive at minimum, which is musically more interesting than
+        // a "subtle DC trim" range.
+        static float MapBias(int v) => (v - 64) * (1f / 32f);
+
+        // OS parameter index → integer oversampling factor.
+        static int MapOsFactor(int v) => v switch
+        {
+            0 => 1,
+            1 => 2,
+            _ => 4,
+        };
 
         // ── Smoothing state (Core §32) ───────────────────────────────────────
         //
         // Persistent end-of-Work values. Updated once per Work() toward the
         // current target (exponential), then sub-block-lerped during render.
+        //
+        // PreTilt is unusual: rather than smoothing the raw [-1, +1] tilt
+        // value (which would require per-sample MathF.Pow to derive the
+        // band gains), we smooth the final linear gains directly. ±12 dB
+        // is a narrow enough dynamic range that linear-space smoothing is
+        // perceptually indistinguishable from dB-space smoothing.
         float _smDrive, _smFold, _smFeedback, _smOutput, _smMix;
+        float _smBias, _smLowGain, _smHighGain;
         bool  _smoothInit;
 
         // ── DSP state ────────────────────────────────────────────────────────
+
         readonly Wavefolder _wfL = new Wavefolder();
         readonly Wavefolder _wfR = new Wavefolder();
+
+        readonly PreTilt _preTiltL = new PreTilt();
+        readonly PreTilt _preTiltR = new PreTilt();
+
+        // One Oversampler instance per (channel × factor). Factor 1 is a
+        // passthrough but exists as a real instance so the dispatch in
+        // Work() can use the same Up()/Down() shape regardless of mode.
+        // Allocated upfront — total cost is well under 2 KB and avoids any
+        // chance of allocation on the audio thread.
+        readonly Oversampler _osL_1x = new Oversampler(1);
+        readonly Oversampler _osR_1x = new Oversampler(1);
+        readonly Oversampler _osL_2x = new Oversampler(2);
+        readonly Oversampler _osR_2x = new Oversampler(2);
+        readonly Oversampler _osL_4x = new Oversampler(4);
+        readonly Oversampler _osR_4x = new Oversampler(4);
 
         // ── ReBuzz lifecycle ─────────────────────────────────────────────────
 
@@ -173,9 +237,6 @@ namespace PedalFolder
         //
         // Effect machine signature per PedalComp §1 / PedalTracker §12.1:
         //   bool Work(Sample[] output, Sample[] input, int n, WorkModes mode);
-        //
-        // Returns true when output was written; false when output is silent
-        // (e.g. no input). ReBuzz uses this to optimise the downstream chain.
         public bool Work(Sample[] output, Sample[] input, int n, WorkModes mode)
         {
             // No input upstream → no output. The wavefolder has no signal
@@ -185,6 +246,31 @@ namespace PedalFolder
 
             int sr = host?.MasterInfo?.SamplesPerSec ?? 44100;
             if (sr <= 0) sr = 44100;
+
+            // ── Discrete (non-smoothed) parameters ───────────────────────────
+            //
+            // Shape and OS are enum selectors. Per Core §32.4, discrete
+            // parameters are not smoothed — switching them produces a
+            // discontinuity but that's the expected behaviour for a mode
+            // switch. (Smoothing an enum would mean briefly running TWO
+            // shapes/factors and crossfading, which is more code than it's
+            // worth for a setup-time parameter.)
+            int shape    = Shape;
+            int osFactor = MapOsFactor(OS);
+
+            // Pick the Oversampler pair for the current factor. By holding
+            // separate instances per factor we don't need to reconfigure
+            // any FIR delay lines on the audio thread — the inactive ones
+            // sit idle with whatever state they last had, which means a
+            // brief artifact when the user toggles OS factor (acceptable;
+            // OS is a setup parameter, not a modulation target).
+            Oversampler osL, osR;
+            switch (osFactor)
+            {
+                case 4:  osL = _osL_4x; osR = _osR_4x; break;
+                case 2:  osL = _osL_2x; osR = _osR_2x; break;
+                default: osL = _osL_1x; osR = _osR_1x; break;
+            }
 
             // ── Stage 1: per-Work exponential smoothing (Core §32.1) ─────────
             //
@@ -198,6 +284,20 @@ namespace PedalFolder
             float feedbackTarget = MapFeedback(Feedback);
             float outputTarget   = MapOutput(Output);
             float mixTarget      = MapMix(Mix);
+            float biasTarget     = MapBias(Bias);
+
+            // PreTilt: convert raw value to per-band linear gains. Use the
+            // RAW (not smoothed) PreTilt value to compute the gain targets,
+            // then smooth the gains themselves below — that way the per-Pow
+            // calls stay outside the inner loop.
+            //
+            // tilt ∈ [-1, +1]. ±0.6 = 12 dB / 20 dB → ±12 dB per band, so
+            // PreTilt = 127 gives +12 dB highs and −12 dB lows (24 dB total
+            // tilt). The gains are reciprocals, so PreTilt = 64 gives 1.0
+            // for both bands → perfectly flat.
+            float tiltTarget     = (PreTilt - 64) * (1f / 64f);
+            float lowGainTarget  = MathF.Pow(10f, -tiltTarget * 0.6f);
+            float highGainTarget = MathF.Pow(10f,  tiltTarget * 0.6f);
 
             // Core §32.3 lazy init: snap smoothed state to targets on first
             // Work after construction, so we don't audibly ramp from 0 at
@@ -209,59 +309,98 @@ namespace PedalFolder
                 _smFeedback = feedbackTarget;
                 _smOutput   = outputTarget;
                 _smMix      = mixTarget;
+                _smBias     = biasTarget;
+                _smLowGain  = lowGainTarget;
+                _smHighGain = highGainTarget;
                 _smoothInit = true;
             }
 
             float smoothCoef = 1f - MathF.Exp(-n / (SMOOTH_SECS * sr));
 
-            float drvStart = _smDrive,    drvEnd = drvStart + (driveTarget    - drvStart) * smoothCoef;
-            float fldStart = _smFold,     fldEnd = fldStart + (foldTarget     - fldStart) * smoothCoef;
-            float fbStart  = _smFeedback, fbEnd  = fbStart  + (feedbackTarget - fbStart)  * smoothCoef;
-            float outStart = _smOutput,   outEnd = outStart + (outputTarget   - outStart) * smoothCoef;
-            float mixStart = _smMix,      mixEnd = mixStart + (mixTarget      - mixStart) * smoothCoef;
+            float drvStart  = _smDrive,    drvEnd  = drvStart  + (driveTarget    - drvStart)  * smoothCoef;
+            float fldStart  = _smFold,     fldEnd  = fldStart  + (foldTarget     - fldStart)  * smoothCoef;
+            float fbStart   = _smFeedback, fbEnd   = fbStart   + (feedbackTarget - fbStart)   * smoothCoef;
+            float outStart  = _smOutput,   outEnd  = outStart  + (outputTarget   - outStart)  * smoothCoef;
+            float mixStart  = _smMix,      mixEnd  = mixStart  + (mixTarget      - mixStart)  * smoothCoef;
+            float biasStart = _smBias,     biasEnd = biasStart + (biasTarget     - biasStart) * smoothCoef;
+            float lgStart   = _smLowGain,  lgEnd   = lgStart   + (lowGainTarget  - lgStart)   * smoothCoef;
+            float hgStart   = _smHighGain, hgEnd   = hgStart   + (highGainTarget - hgStart)   * smoothCoef;
 
             _smDrive    = drvEnd;
             _smFold     = fldEnd;
             _smFeedback = fbEnd;
             _smOutput   = outEnd;
             _smMix      = mixEnd;
+            _smBias     = biasEnd;
+            _smLowGain  = lgEnd;
+            _smHighGain = hgEnd;
 
             // ── Stage 2: per-sample linear interpolation through the buffer ──
             //
-            // Per Core §32.7 ("Per-sample render (no sub-block)") — the
-            // wavefolder has no internal block structure, so we lerp every
-            // sample directly. invN normalises sample-index to [0, 1).
+            // Per Core §32.7 ("Per-sample render (no sub-block)"). All
+            // smoothed params lerp at SOURCE rate (not OS rate) — they're
+            // constant across the OS samples within one source sample,
+            // which is plenty smooth since SMOOTH_SECS at any reasonable
+            // sample rate is hundreds of source samples.
             float invN = (n > 1) ? 1f / (n - 1) : 0f;
 
-            // Cache per-sample deltas to avoid one subtraction per sample.
-            float drvDelta = drvEnd - drvStart;
-            float fldDelta = fldEnd - fldStart;
-            float fbDelta  = fbEnd  - fbStart;
-            float outDelta = outEnd - outStart;
-            float mixDelta = mixEnd - mixStart;
+            float drvDelta  = drvEnd  - drvStart;
+            float fldDelta  = fldEnd  - fldStart;
+            float fbDelta   = fbEnd   - fbStart;
+            float outDelta  = outEnd  - outStart;
+            float mixDelta  = mixEnd  - mixStart;
+            float biasDelta = biasEnd - biasStart;
+            float lgDelta   = lgEnd   - lgStart;
+            float hgDelta   = hgEnd   - hgStart;
+
+            // PreTilt LP coefficient. Rate-dependent (per Core §29); recomputed
+            // every Work in case the host changes sample rate mid-song.
+            float lpCoef = 1f - MathF.Exp(-2f * MathF.PI * PRE_TILT_CORNER_HZ / sr);
 
             // ── Per-sample inner loop ────────────────────────────────────────
             for (int i = 0; i < n; i++)
             {
                 float t = i * invN;
 
-                float drv = drvStart + drvDelta * t;
-                float fld = fldStart + fldDelta * t;
-                float fb  = fbStart  + fbDelta  * t;
-                float gOut = outStart + outDelta * t;
-                float mix = mixStart + mixDelta * t;
+                // Sample-rate lerped params (constant across OS samples).
+                float drv  = drvStart  + drvDelta  * t;
+                float fld  = fldStart  + fldDelta  * t;
+                float fb   = fbStart   + fbDelta   * t;
+                float gOut = outStart  + outDelta  * t;
+                float mix  = mixStart  + mixDelta  * t;
+                float bias = biasStart + biasDelta * t;
+                float lg   = lgStart   + lgDelta   * t;
+                float hg   = hgStart   + hgDelta   * t;
 
                 // Normalise input ±32768 → ±1.0 (PedalComp §1).
                 float inL = input[i].L * SCALE;
                 float inR = input[i].R * SCALE;
 
-                // Per-channel wavefold.
-                float wetL = _wfL.Process(inL, drv, fld, fb);
-                float wetR = _wfR.Process(inR, drv, fld, fb);
+                // Pre-fold tilt EQ. Runs at source rate (before upsampling)
+                // — tilting at OS rate would require pole frequency scaling
+                // that buys us nothing, since 800 Hz is far below source
+                // Nyquist already.
+                float preL = _preTiltL.Process(inL, lpCoef, lg, hg);
+                float preR = _preTiltR.Process(inR, lpCoef, lg, hg);
 
-                // Apply post-fold trim and dry/wet mix.
-                float outL = (inL * (1f - mix) + wetL * gOut * mix);
-                float outR = (inR * (1f - mix) + wetR * gOut * mix);
+                // Upsample, fold each OS sample, downsample. For OS=1 these
+                // are passthrough no-ops on the buffer, so the code path is
+                // uniform across factors.
+                osL.Up(preL);
+                osR.Up(preR);
+                for (int k = 0; k < osFactor; k++)
+                {
+                    osL.Buffer[k] = _wfL.Process(osL.Buffer[k], drv, fld, fb, bias, shape);
+                    osR.Buffer[k] = _wfR.Process(osR.Buffer[k], drv, fld, fb, bias, shape);
+                }
+                float wetL = osL.Down();
+                float wetR = osR.Down();
+
+                // Apply post-fold trim and dry/wet mix. Dry path uses the
+                // RAW input, not the PreTilt'd one — PreTilt is a fold-
+                // sculpting tool, not a tone EQ on the dry signal.
+                float outL = inL * (1f - mix) + wetL * gOut * mix;
+                float outR = inR * (1f - mix) + wetR * gOut * mix;
 
                 // De-normalise ±1.0 → ±32768. PedalComp §1 idiom: assign a
                 // fresh Sample struct rather than mutating fields in place.

@@ -13,6 +13,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Reference Include="BuzzGUI.Common">
+      <HintPath>C:\Program Files\ReBuzz\BuzzGUI.Common.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
     <Reference Include="BuzzGUI.Interfaces">
       <HintPath>C:\Program Files\ReBuzz\BuzzGUI.Interfaces.dll</HintPath>
       <Private>false</Private>

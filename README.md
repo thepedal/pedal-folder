@@ -185,3 +185,15 @@ Preset-compatible with v1.0: old presets load with the new parameters
 at their defaults, which preserves v1.0 character except that **OS
 defaults to 2×** (the only audible change). Set OS to 1× to recover
 exact v1.0 behaviour.
+
+---
+
+## License & credits
+
+Licensed under the **GNU General Public License v3.0** — see the `LICENSE`
+file for the full text.
+
+The core fold algorithm follows Jatin Chowdhury's *Complex Nonlinearities:
+Wavefolder* (https://ccrma.stanford.edu/~jatin/ComplexNonlinearities/Wavefolder.html),
+extended here with a bias offset, selectable fold shapes, pre-fold tilt EQ
+and oversampling.

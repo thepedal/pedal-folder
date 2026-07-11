@@ -22,8 +22,11 @@
 //     instances per channel based on the OS parameter
 
 using System;
+using System.Collections.Generic;   // IEnumerable<T> for Commands
+using System.Windows;               // MessageBox (About window)
 using Buzz.MachineInterface;
 using BuzzGUI.Interfaces;
+using BuzzGUI.Common;               // MenuItemVM, SimpleCommand
 
 namespace PedalFolder
 {
@@ -35,6 +38,37 @@ namespace PedalFolder
         OutputCount = 1)]
     public class PedalFolderMachine : IBuzzMachine
     {
+        // Single source of truth for the machine version — used by the About
+        // window (AboutWindow §1.3). Bump here on release.
+        internal const string Version = "1.2.0";
+
+        // ── Right-click About... menu entry (AboutWindow §1.4) ────────────────
+        public IEnumerable<IMenuItem> Commands
+        {
+            get
+            {
+                yield return new MenuItemVM()
+                {
+                    Text = "About...",
+                    Command = new SimpleCommand()
+                    {
+                        CanExecuteDelegate = p => true,
+                        ExecuteDelegate    = p => MessageBox.Show(
+                            $"Pedal Folder   v{Version}\n\n" +
+                            "Feedback wavefolder. Three fold shapes (sine, triangle,\n" +
+                            "wrap), pre-fold drive, bias and tilt EQ, resonant\n" +
+                            "feedback, and 1x/2x/4x oversampling.\n\n" +
+                            "Fold algorithm after Jatin Chowdhury,\n" +
+                            "Complex Nonlinearities: Wavefolder.\n\n" +
+                            "Author: Pedal\n" +
+                            "github.com/thepedal/pedal-folder\n" +
+                            "GPL-3.0 License",
+                            "About Pedal Folder")
+                    }
+                };
+            }
+        }
+
         // ── Constants ────────────────────────────────────────────────────────
         //
         // PedalComp §1: ReBuzz delivers samples at ±32768. Normalise to ±1.0
@@ -216,6 +250,11 @@ namespace PedalFolder
         readonly PreTilt _preTiltL = new PreTilt();
         readonly PreTilt _preTiltR = new PreTilt();
 
+        // DC removal on the wet path (Core §43). Needed only because Bias makes
+        // the fold transfer asymmetric — see DcBlocker.cs. One per channel.
+        readonly DcBlocker _dcL = new DcBlocker();
+        readonly DcBlocker _dcR = new DcBlocker();
+
         // One Oversampler instance per (channel × factor). Factor 1 is a
         // passthrough but exists as a real instance so the dispatch in
         // Work() can use the same Up()/Down() shape regardless of mode.
@@ -357,6 +396,11 @@ namespace PedalFolder
             // every Work in case the host changes sample rate mid-song.
             float lpCoef = 1f - MathF.Exp(-2f * MathF.PI * PRE_TILT_CORNER_HZ / sr);
 
+            // DC-blocker poles track the host rate too (Core §29). No-op when
+            // the rate is unchanged, so this is free on the common path.
+            _dcL.SetSampleRate(sr);
+            _dcR.SetSampleRate(sr);
+
             // ── Per-sample inner loop ────────────────────────────────────────
             for (int i = 0; i < n; i++)
             {
@@ -395,6 +439,14 @@ namespace PedalFolder
                 }
                 float wetL = osL.Down();
                 float wetR = osR.Down();
+
+                // Strip the DC that Bias's asymmetric transfer generates (and
+                // that the feedback loop compounds) before it reaches the mix.
+                // Wet path only — the dry signal passes through untouched. The
+                // even harmonics Bias exists to create are unaffected; only the
+                // 0 Hz component goes. See DcBlocker.cs.
+                wetL = _dcL.Process(wetL);
+                wetR = _dcR.Process(wetR);
 
                 // Apply post-fold trim and dry/wet mix. Dry path uses the
                 // RAW input, not the PreTilt'd one — PreTilt is a fold-
